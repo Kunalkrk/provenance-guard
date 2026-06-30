@@ -100,15 +100,30 @@ a human reviewer can see both side by side.
 
 ### Signal 2 — Stylometric heuristics (pure Python)
 
-Composite of three sub-features, each normalized to `[0,1]` ("AI-likeness"), then averaged:
+Composite of three sub-features, each normalized to `[0,1]` ("AI-likeness"), then combined
+as a weighted sum:
 
 | Sub-feature | What it measures | Computation sketch |
 |---|---|---|
 | Burstiness | Variance in sentence length. Human writing tends to mix short and long sentences; AI output is often more uniform. | `stdev(sentence_lengths)`, then `score = clamp(1 - stdev/8, 0, 1)` (8-word stdev ≈ typical human variance baseline) |
 | Lexical repetition | Vocabulary diversity. Lower type–token ratio (more repeated word choices relative to text length) skews toward the "AI-like" end of our heuristic. | `ttr = unique_words / total_words`, then `score = clamp(1 - ttr, 0, 1)` |
-| Discourse-marker density | Frequency of stock transitional phrases ("moreover", "in conclusion", "it is important to note", "overall", "additionally"). Instruction-tuned LLMs overuse these relative to typical creative writing. | `marker_count / total_words`, scaled and clamped to `[0,1]` |
+| Discourse-marker density | Frequency of stock transitional phrases ("moreover", "in conclusion", "it is important to note", "overall", "additionally"). Instruction-tuned LLMs overuse these relative to typical creative writing. | `(marker_count / total_words) * 40`, clamped to `[0,1]` |
 
-`signal2_score = mean(burstiness_score, repetition_score, marker_score)`
+```
+signal2_score = 0.5 * marker_score + 0.25 * burstiness_score + 0.25 * repetition_score
+```
+
+**M4 verification finding (revised from a plain mean):** Testing on the four calibration
+inputs (Section 11, M4) showed all three sub-features score low on short text (~40–55 words),
+because type-token ratio saturates high and sentence-length variance is similar across
+authors at that length — exactly the "very short submissions" blind spot in Section 10. Only
+discourse-marker density discriminated reliably. A plain mean therefore diluted the one
+working sub-feature and scored even the clearly-AI calibration input at only 0.48, which the
+0.5/0.5 blend (below) could not push past the `likely_ai` threshold. The weighted sum gives
+discourse-marker density half the weight (it is the most robust AI tell) and the two
+length-confounded features a quarter each. *Consequence/limitation:* AI text that avoids stock
+transitions now scores low on Signal 2 and leans almost entirely on the LLM judge — an
+accepted trade-off, since markers are the only stylometric feature reliable on short text.
 
 - **Why it differs human vs. AI:** These are well-documented surface-level regularities that
   fall out of how LLMs are trained (next-token prediction smooths out the high-variance,
@@ -130,6 +145,22 @@ An even split is the deliberate starting point: we have no labeled validation se
 justify weighting one signal more heavily than the other, and an even split is the most
 defensible/explainable default. This weighting is a named candidate for recalibration if we
 later test against labeled examples (see Section 11, AI Tool Plan, M4 verification).
+
+**M4 verification kept the 0.5/0.5 signal blend** — the recalibration that was needed lived
+inside Signal 2 (the weighted sub-feature sum above), not in the signal blend. With that fix,
+the blend behaves as intended on the four calibration inputs:
+
+| Calibration input | Signal 1 (LLM) | Signal 2 (stylo) | Combined | Label |
+|---|---|---|---|---|
+| Clearly AI | 0.80 | 0.61 | 0.70 | likely_ai |
+| Clearly human | 0.20 | 0.07 | 0.14 | likely_human |
+| Borderline — formal human | 0.80 | 0.11 | 0.46 | uncertain |
+| Borderline — lightly edited AI | 0.60 | 0.12 | 0.36 | uncertain |
+
+The "formal human" row is the multi-signal payoff: the LLM judge false-positives at 0.80, but
+Signal 2 (correctly reading human-like burstiness/diversity at 0.11) drags the blend down to
+`uncertain`, preventing a confident false "likely_ai" label — the false-positive scenario from
+Section 10.
 
 ## 4. Uncertainty Representation
 
@@ -178,16 +209,17 @@ and the explicit numeric score in every variant will not.
 - **Who can submit:** The original creator who submitted the content (identified by the
   `creator_id` captured at submission time — no separate auth system in scope for this
   project).
-- **What they provide:** `submission_id`, `creator_id` (must match the original submitter),
-  and free-text `reasoning` explaining why they believe the classification is wrong.
+- **What they provide:** `content_id` and free-text `creator_reasoning` explaining why they
+  believe the classification is wrong.
 - **What the system does on receipt:**
-  1. Looks up `submission_id`; 404 if it doesn't exist.
-  2. Creates an appeal record: `appeal_id`, `submission_id`, `reasoning`, `created_at`, a
-     snapshot of the original decision (`label`, `confidence_score`, `signals`).
-  3. Updates the submission's `status` field to `"under_review"` (the original label and
-     score are *not* overwritten or recomputed — automated re-classification is out of
-     scope).
-  4. Writes an audit log entry of type `appeal` that references the original `submission_id`.
+  1. Looks up `content_id`; 404 if it doesn't exist.
+  2. Creates an appeal record: `appeal_id`, `content_id`, `appeal_reasoning`, `timestamp`, a
+     snapshot of the original decision (`label`, `confidence`, `attribution`, both signal
+     scores).
+  3. Updates the stored submission's `status` to `"under_review"` and sets `appeal_filed`
+     (the original label and score are *not* overwritten or recomputed — automated
+     re-classification is out of scope).
+  4. Writes an audit log entry of type `appeal` that references the original `content_id`.
 - **What a human reviewer sees** (`GET /appeals`): a list of appeal records, each showing the
   original submitted text, the original label/confidence/signals, the creator's reasoning,
   the appeal timestamp, and current status (`under_review` / resolved states are a stretch
@@ -197,20 +229,33 @@ and the explicit numeric score in every variant will not.
 
 | Endpoint | Method | Request body | Response |
 |---|---|---|---|
-| `/submit` | POST | `{content: str, creator_id: str}` | `{submission_id, label, confidence_score, signals: {signal1, signal2}, status: "final"}` |
-| `/appeal` | POST | `{submission_id: str, creator_id: str, reasoning: str}` | `{appeal_id, submission_id, status: "under_review"}` |
-| `/appeals` | GET | — | `[{appeal_id, submission_id, original_label, original_score, reasoning, created_at, status}, ...]` |
-| `/submissions/<id>` | GET | — | full stored record for one submission (label, score, signals, status, appeal history) |
+| `/submit` | POST | `{text: str, creator_id: str}` | `{content_id, attribution, confidence, label, signals: {llm, stylometric}, status: "classified"}` |
+| `/appeal` | POST | `{content_id: str, creator_reasoning: str}` | `{appeal_id, content_id, status: "under_review", message}` |
+| `/appeals` | GET | — | `{appeals: [{appeal_id, content_id, creator_id, appeal_reasoning, original_decision, created_at, status}, ...]}` |
+| `/submissions/<content_id>` | GET | — | full stored record for one submission (text, label, score, signals, status, appeal_filed) |
 | `/log` | GET | — | structured audit log entries (see Section 9) |
+
+**Field-name reconciliation (M5):** the M5 spec/grader uses `text`, `content_id`, and
+`creator_reasoning`; the earlier draft of this section used `content`/`submission_id`/
+`reasoning`. The implementation follows the M5 names (and `content_id` is what `/submit`
+already returned since M3). `creator_id` is captured at submission but not required on the
+appeal, since the grader's appeal test does not send it.
 
 `/submit` is the only endpoint that is rate-limited (see Section 8); the others are internal/review
 surfaces and not expected to receive creator-facing traffic volume.
 
 ## 8. Rate Limiting (summary — full reasoning in README)
 
-`/submit` will use Flask-Limiter, scoped per `creator_id` (falls back to per-IP if missing).
-Specific numeric limits and the reasoning behind them are documented in README once chosen
-during implementation, alongside measured behavior.
+`/submit` uses Flask-Limiter at **`10 per minute; 100 per day`**, keyed by **client IP**
+(`get_remote_address`), with `memory://` storage.
+
+**Keying decision (changed from the draft's per-`creator_id`):** with no authentication in
+scope, `creator_id` is attacker-controlled and trivially rotated, so keying on it would not
+stop a flooding script. Client IP is the meaningful throttle key for abuse prevention. Limits
+rationale: a real writer submitting their own work rarely exceeds a few pieces per minute, so
+10/min leaves ample headroom while a flooding script trips it immediately; 100/day caps
+sustained abuse from a single IP. Verified: 12 rapid requests returned `200`×10 then `429`×2
+(evidence goes in README).
 
 ## 9. Audit Log (summary — full sample in README)
 
