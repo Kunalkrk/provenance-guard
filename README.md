@@ -11,6 +11,12 @@ rationale and architecture diagrams live in [planning.md](planning.md).
 
 ---
 
+## Demo Video
+
+https://streamyard.com/uk6jx2fjpcep
+
+---
+
 ## Table of contents
 
 - [Setup & running](#setup--running)
